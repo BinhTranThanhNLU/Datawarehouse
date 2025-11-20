@@ -36,6 +36,16 @@ def run_aggregate():
             f.date_key,
             c.wind_gust_dir
         """
+
+        df_summary = pd.read_sql(query, con=warehouse_engine)
+
+        if df_summary.empty:
+            print("No data to aggregate.")
+            log_end(log_id, 'success', 0, "No data found in warehouse to aggregate.")
+            return
+
+        print(f"Aggregated {len(df_summary)} summary records.")
+
     except Exception as e:
         error_message = f"Error during aggregation: {e}"
         print(error_message)
