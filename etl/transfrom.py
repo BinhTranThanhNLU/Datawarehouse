@@ -4,32 +4,62 @@ from logger import log_start, log_end
 
 
 def run_transform():
+    # 2. Gọi log_start("transform")
     log_id = log_start("transform")
+
+    # 3. Lưu log_id để kết thúc log sau khi chạy xong
     records_loaded = 0
 
     try:
+        # 4. Kiểm tra kết nối Database
         if staging_engine is None or warehouse_engine is None:
-            raise Exception("Database engines not initialized.")
+            # Không - Ghi log cảnh báo: "Không thể kết nối database" → Kết thúc tiến trình
+            error_message = "Không thể kết nối database"
+            print(f"Cảnh báo: {error_message}")
+            if log_id:
+                log_end(log_id, 'failed', 0, error_message)
+            return
 
-        # 1. Read data from staging
-        print("Reading data from staging_layer.weather_raw...")
+        # Có - Tiếp tục
+        print("Kết nối database thành công.")
+
+        # 5. Đọc dữ liệu từ /staging_layer/
+        # SELECT * FROM staging_layer.weather_raw;
+        print("Bước 5: Đọc dữ liệu từ staging_layer/SELECT * FROM staging_layer.weather_raw")
         with staging_engine.connect() as conn:
             df_staging = pd.read_sql_table('weather_raw', conn)
 
+        # 6. Đọc dữ liệu thành công?
         if df_staging.empty:
-            print("No data in staging layer to transform.")
-            log_end(log_id, 'success', 0, "No data in staging.")
+            # Không - Ghi log success (nhưng 0 records)
+            success_message = "Không có dữ liệu trong staging layer để transform"
+            print(success_message)
+            log_end(log_id, 'success', 0, success_message)
             return
 
-        # 2. Clean NULL values
+        # Có - Tiếp tục
+        print(f"Đọc thành công {len(df_staging)} bản ghi từ staging layer.")
+
+        # 6. Xử lý dữ liệu trước khi tạo Dimensions (xử lý null, loại bỏ record không hợp lệ)
+        print("Bước 6: Xử lý dữ liệu - làm sạch null values và loại bỏ records không hợp lệ")
+
+        # Xử lý NULL values cho các cột categorical
         cat_cols = ['WindGustDir', 'WindDir9am', 'WindDir3pm', 'RainToday', 'RainTomorrow']
         df_staging[cat_cols] = df_staging[cat_cols].fillna('Unknown')
+
+        # Loại bỏ records không hợp lệ (missing Date hoặc Location)
+        initial_count = len(df_staging)
         df_staging = df_staging.dropna(subset=['Date', 'Location'])
+        final_count = len(df_staging)
+        print(f"Đã loại bỏ {initial_count - final_count} records không hợp lệ")
+
+        # 7. Tạo và Load Dimension Tables (Dimension: dim_location, Dimension: dim_date, mension: dim_weather_condition)
+        print("Bước 7: Tạo và Load Dimension Tables")
 
         # =======================================
-        # 3. Create dim_location
+        # 7.1. Create dim_location
         # =======================================
-        print("Processing dim_location...")
+        print("7.1. Tạo dim_location...")
         df_dim_location = (
             pd.DataFrame(df_staging['Location'].unique(), columns=['location_name'])
             .sort_values('location_name')
@@ -37,13 +67,13 @@ def run_transform():
         )
         df_dim_location['location_key'] = range(1, len(df_dim_location) + 1)
         df_dim_location.to_sql('dim_location', con=warehouse_engine, if_exists='replace', index=False)
-
         df_dim_location_with_keys = pd.read_sql_table('dim_location', con=warehouse_engine)
+        print(f"Đã tạo dim_location với {len(df_dim_location)} records")
 
         # =======================================
-        # 4. Create dim_date
+        # 7.2. Create dim_date
         # =======================================
-        print("Processing dim_date...")
+        print("7.2. Tạo dim_date...")
         df_staging['Date'] = pd.to_datetime(df_staging['Date'])
         df_dim_date = pd.DataFrame(df_staging['Date'].unique(), columns=['full_date'])
         df_dim_date = df_dim_date.dropna()
@@ -58,11 +88,12 @@ def run_transform():
 
         df_dim_date.to_sql('dim_date', con=warehouse_engine, if_exists='replace', index=False)
         df_dim_date_with_keys = pd.read_sql_table('dim_date', con=warehouse_engine)
+        print(f"Đã tạo dim_date với {len(df_dim_date)} records")
 
         # =======================================
-        # 5. Create dim_weather_condition
+        # 7.3. Create dim_weather_condition
         # =======================================
-        print("Processing dim_weather_condition...")
+        print("7.3. Tạo dim_weather_condition...")
         condition_cols = ['WindGustDir', 'WindDir9am', 'WindDir3pm', 'RainToday', 'RainTomorrow']
 
         df_dim_condition = (
@@ -83,11 +114,17 @@ def run_transform():
             con=warehouse_engine, if_exists='replace', index=False
         )
         df_dim_condition_with_keys = pd.read_sql_table('dim_weather_condition', con=warehouse_engine)
+        print(f"Đã tạo dim_weather_condition với {len(df_dim_condition)} records")
 
         # =======================================
-        # 6. Merge dimensions to build fact table
+        # 8. Tập tục load Dimension
         # =======================================
-        print("Merging dimensions to create fact_weather...")
+        print("Bước 8: Hoàn tất load các Dimension tables")
+
+        # =======================================
+        # 10. Tạo dữ liệu Fact (Merge dimensions)
+        # =======================================
+        print("Bước 10: Tạo dữ liệu Fact (Merge dimensions)")
         df_fact_data = df_staging.copy()
 
         # Merge Location
@@ -126,7 +163,7 @@ def run_transform():
         df_fact_data = df_fact_data.drop(columns=[c for c in drop_cols if c in df_fact_data])
 
         # =======================================
-        # 7. Select columns for fact table
+        # Select columns for fact table
         # =======================================
         fact_columns_map = {
             'location_key': 'location_key',
@@ -158,10 +195,24 @@ def run_transform():
         # Remove duplicates
         df_fact_weather = df_fact_weather.drop_duplicates()
 
+        # Kiểm tra số lượng records sau khi merge
+        records_loaded = len(df_fact_weather)
+
+        # Kiểm tra đáng số bản ghi fact_weather > 0 không?
+        if records_loaded == 0:
+            # Nếu = 0: Ghi log lỗi
+            error_message = "Không có dữ liệu hợp lệ sau khi merge dimensions"
+            print(f"Lỗi: {error_message}")
+            log_end(log_id, 'failed', 0, error_message)
+            return
+
+        # Nếu > 0: Tiếp tục
+        print(f"Có {records_loaded} records hợp lệ để load vào fact table")
+
         # =======================================
-        # 8. Load fact_weather
+        # 11. Tiến tục load
         # =======================================
-        print("Loading fact_weather...")
+        print("Bước 11: Load dữ liệu vào fact_weather...")
         df_fact_weather.to_sql(
             'fact_weather',
             con=warehouse_engine,
@@ -170,17 +221,21 @@ def run_transform():
             chunksize=1000
         )
 
-        records_loaded = len(df_fact_weather)
-        print(f"Successfully loaded {records_loaded} records to fact_weather.")
-        log_end(log_id, 'success', records_loaded, "Data transformed to warehouse.")
+        # 12. Ghi log: log_end(log_id, "success", records, "Data transformed to warehouse")
+        success_message = "Data transformed to warehouse"
+        print(f"Bước 12: Ghi log thành công - {records_loaded} records đã được load")
+        log_end(log_id, 'success', records_loaded, success_message)
 
     except Exception as e:
+        # Xử lý lỗi: Ghi log lỗi và kết thúc
         error_message = f"Error during transformation: {e}"
-        print(error_message)
+        print(f"Lỗi xảy ra: {error_message}")
         if log_id:
             log_end(log_id, 'failed', 0, error_message)
         raise e
 
 
 if __name__ == "__main__":
+    # 1. runTransformLoadForConfig (entry point)
+    print("Bước 1: Bắt đầu quá trình Transform")
     run_transform()
